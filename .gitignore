@@ -1,0 +1,43 @@
+# --- Virtual environments (never push: machine-specific, huge) ---
+.venv/
+venv/
+env/
+
+# --- Python bytecode / caches (regenerated automatically) ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Derived pipeline output (regenerate with: python main.py) ---
+# The pipeline's own output file is a build artifact: it is fully
+# reproducible from the frozen input data + source code, so it does not
+# belong in version control.
+burnin_screening/data/pipeline_output.csv
+
+# --- Secrets / environment files (hygiene; none in use in this repo) ---
+.env
+.env.*
+
+# --- Packaging / build artifacts ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- IDE / editor junk ---
+.idea/
+.vscode/
+*.swp
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Note on what is INTENTIONALLY tracked ---
+# burnin_screening/data/burnin_data.csv IS committed: it is the frozen,
+# seeded (deterministic) input fixture both modules build against, named in
+# the contract (§4a repo layout). Anyone cloning gets identical data.

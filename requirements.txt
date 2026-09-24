@@ -1,0 +1,21 @@
+# Burn-in Predictive Screening — runtime + test dependencies
+# Python >= 3.11 recommended (verified on 3.14.2).
+#
+# Install:
+#   python -m venv .venv
+#   .venv/Scripts/pip install -r requirements.txt      (Windows)
+#   source .venv/bin/activate && pip install -r requirements.txt   (macOS/Linux)
+#
+# Versions pinned to the exact environment the project was developed and
+# verified on (93 tests passing). xgboost/mapie/sklearn move fast; if you
+# bump them, rerun the full suite (cd burnin_screening && python -m pytest).
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+scikit-learn==1.9.1
+xgboost==3.4.1
+mapie==1.5.0          # NOTE: >=1.0 removed MapieRegressor; this project uses
+                      # CrossConformalRegressor (see module_b_temporal.py)
+
+# --- Testing (optional but recommended) ---
+pytest==9.1.1
