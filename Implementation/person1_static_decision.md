@@ -154,6 +154,17 @@ def run_module_b(df, params: list, train: bool = True, with_intervals: bool = Fa
       multiplier showed the drift gate is the only effective FN lever on
       the compound-defect case (see person1 doc §8 step 6); 3.0 remains the
       spec default here so the required path is unchanged by default.
+    theta_blended (additive, default False; Phase 1 report §8b): derive
+      theta_slope PER LOT reusing Module A's small-lot Empirical Bayes
+      pattern (w = N/(N+30)): lot_theta = w * (lot median + theta_k * lot
+      MAD) + (1 - w) * (global median + theta_k * global MAD), all over the
+      normal population. When True, run_module_b returns
+      dict[lot_id -> theta] as its third element and drift_flag uses each
+      row's own lot's theta; small lots shrink toward the global prior
+      instead of getting a noise-driven gate. Default False keeps the
+      single global theta_slope (required path unchanged); stress-level
+      stratification (V_stress/T_ambient grouping) is a documented TODO —
+      the synthetic generator's physics does not vary with stress yet.
     with_intervals=True (🔵 Prompt B3): fits a MAPIE conformal wrapper
       (CrossConformalRegressor, method="plus", cv=5, confidence_level=0.95 —
       the MAPIE>=1.0 successor of MapieRegressor) for the 168h target
@@ -187,19 +198,25 @@ Any change to either contract (new column, renamed column, changed meaning) must
 ### 4f. Decision contract (Decision Maker's inputs/outputs — Person 1)
 
 ```python
-def decide(df, params, theta_slope: float, theta_width: float | None = None):
+def decide(df, params, theta_slope: float, theta_width: float | None = None,
+           Y_spec: dict | None = None):
     """
     Returns df with two columns ADDED:
       decision             str    — "PASS" | "REVIEW" | "FLAG"
       reason               str    — plain-language, always names the parameter(s)
     Priority order (first match wins):
-      1. any {p}_hard_flag        -> FLAG   (Tier 1)
-      2. joint_outlier_flag       -> FLAG   (Tier 3)
-      3. static_outlier_flag      -> FLAG   (fused lot outlier)
-      4. drift_flag               -> FLAG   (safety-slope breach)
-      5. ood_flag                 -> REVIEW (OOD inputs — predictions untrustworthy)
-      6. widest relative 168h interval > theta_width -> REVIEW (low confidence)
-      7. otherwise                -> PASS
+      1. any {p}_hard_flag        -> FLAG   (Tier 1, measured 24h)
+      2. {p}_168h_pred >= Y_spec[p] with a narrow interval -> FLAG (predicted
+         168h breach — §8a of the Phase 1 report; independent of the drift
+         gate. "Narrow" = the parameter's relative interval width is <=
+         theta_width; with intervals off/theta_width=None every predicted
+         breach is flaggable. Inert without Y_spec.)
+      3. joint_outlier_flag       -> FLAG   (Tier 3)
+      4. static_outlier_flag      -> FLAG   (fused lot outlier)
+      5. drift_flag               -> FLAG   (safety-slope breach)
+      6. ood_flag                 -> REVIEW (OOD inputs — predictions untrustworthy)
+      7. widest relative 168h interval > theta_width -> REVIEW (low confidence)
+      8. otherwise                -> PASS
     Team decision (Phase 3): REVIEW NEVER OVERRIDES FLAG — the uncertainty
     signals (5/6) only defer rows that would otherwise PASS. Conservative for
     false negatives, which the eval metric penalizes most.
@@ -207,6 +224,11 @@ def decide(df, params, theta_slope: float, theta_width: float | None = None):
     crashes and never creates a REVIEW):
       ood_flag, ood_score            — attached by main.py (Prompt B4 helpers,
                                        combined feature set, one verdict/component)
+      Y_spec                         — dict[param -> datasheet limit] enabling
+                                       branch 2 (predicted 168h breach, §8a);
+                                       None/{} leaves the branch inert — absence
+                                       degrades to the Phase 3 7-branch behavior,
+                                       never crashes and never creates a FLAG
       {p}_168h_lower/{p}_168h_upper  — Module B's MAPIE intervals (with_intervals=True)
       theta_width                    — interval-width REVIEW threshold
     theta_width derivation (main.derive_theta_width, same philosophy as
@@ -223,8 +245,10 @@ def decide(df, params, theta_slope: float, theta_width: float | None = None):
 ```
 
 Pipeline wiring (main.run_pipeline, all 🔵 add-ons default True, each independently
-switchable): `with_intervals` (Prompt B3 intervals + branch 6), `with_ood` (Prompt B4
-helpers + branch 5), `with_progressive_refinement` — reads `{p}_{h}h_actual` columns
+switchable): `with_intervals` (Prompt B3 intervals + branch 7), `with_ood` (Prompt B4
+helpers + branch 6), `theta_blended` (§8b per-lot Empirical-Bayes theta_slope, default
+False — the global theta stays the required-path default), `with_progressive_refinement`
+— reads `{p}_{h}h_actual` columns
 (Prompt B5 naming) when present, prefers measured over predicted per row, recomputes
 `{p}_slope`/`{p}_slope_norm`/`v_drift`/`drift_flag` from the refined mix (per-row slope
 window: 168h actual -> /144, 96h actual only -> measured 24h->96h window /72), writes

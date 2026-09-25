@@ -176,6 +176,111 @@ def test_wide_interval_never_overrides_flag():
 
 
 # ---------------------------------------------------------------------------
+# Predicted-168h-breach FLAG branch (decision_maker branch 2 — §8a)
+# ---------------------------------------------------------------------------
+YSPEC = {"I_leak": 50.0, "I_ddq": 10.0, "t_pd": 40.0}
+
+
+def _breach_row(pred: float = 55.0, limit_param: str = "I_leak") -> dict:
+    """Clean row whose predicted 168h value for one parameter crosses Y_spec."""
+    r = _base_row()
+    for p in PARAMS:
+        r[f"{p}_168h_pred"] = pred if p == limit_param else 1.0
+        r[f"{p}_168h_lower"] = 0.5
+        r[f"{p}_168h_upper"] = 1.5
+    return r
+
+
+def test_breach_flag_fires_when_prediction_crosses_limit():
+    r = _breach_row(pred=55.0)  # I_leak pred 55 >= Y_spec 50, width 1.0 (narrow)
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec=YSPEC)
+    assert out.loc[0, "decision"] == "FLAG"
+    reason = out.loc[0, "reason"]
+    assert "Predicted 168h" in reason and "I_leak" in reason
+    assert "55" in reason and "50" in reason  # cites value + limit
+
+
+def test_breach_inert_without_y_spec():
+    """No Y_spec -> branch 2 inert; the same row would otherwise PASS."""
+    r = _breach_row(pred=55.0)
+    out = decide(_frame([r]), PARAMS, THETA)          # Y_spec defaults to None
+    assert out.loc[0, "decision"] == "PASS"
+    out2 = decide(_frame([r]), PARAMS, THETA, Y_spec={})  # empty dict also inert
+    assert out2.loc[0, "decision"] == "PASS"
+
+
+def test_breach_below_limit_stays_pass():
+    r = _breach_row(pred=45.0)  # 45 < 50
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec=YSPEC)
+    assert out.loc[0, "decision"] == "PASS"
+
+
+def test_breach_wide_interval_does_not_flag():
+    """'Narrow interval' gate: a wide interval defers to the width REVIEW branch."""
+    r = _breach_row(pred=55.0)
+    r["I_leak_168h_lower"] = 5.0
+    r["I_leak_168h_upper"] = 105.0    # width 100 / pred 55 ~ 1.82 — wide
+    out = decide(_frame([r]), PARAMS, THETA, theta_width=0.5, Y_spec=YSPEC)
+    assert out.loc[0, "decision"] == "REVIEW"
+    assert "interval" in out.loc[0, "reason"]
+
+
+def test_breach_without_intervals_flags_unconditionally():
+    """No theta_width -> no width to check -> every predicted breach flags."""
+    r = _breach_row(pred=55.0)
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec=YSPEC)  # theta_width=None
+    assert out.loc[0, "decision"] == "FLAG"
+
+
+def test_breach_never_overrides_higher_priority_flags():
+    """A measured 24h hard violation outranks the predicted breach (branch 1 > 2)."""
+    r = _breach_row(pred=55.0)
+    r["t_pd_hard_flag"] = True
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec=YSPEC)
+    assert out.loc[0, "decision"] == "FLAG"
+    assert "Hard limit" in out.loc[0, "reason"]
+
+
+def test_breach_outranks_joint_static_drift():
+    """Branch 2 sits above the statistical layers (3/4/5)."""
+    r = _breach_row(pred=55.0)
+    r["joint_outlier_flag"] = True
+    r["joint_anomaly_score"] = 0.6
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec=YSPEC)
+    assert "Predicted 168h" in out.loc[0, "reason"]
+
+
+def test_breach_multiple_parameters_all_listed():
+    r = _breach_row()
+    r["I_ddq_168h_pred"] = 12.0   # >= 10
+    r["t_pd_168h_pred"] = 45.0    # >= 40
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec=YSPEC)
+    assert out.loc[0, "decision"] == "FLAG"
+    reason = out.loc[0, "reason"]
+    for p in PARAMS:
+        assert p in reason
+
+
+def test_breach_unknown_parameter_in_y_spec_is_skipped():
+    """A Y_spec entry for a parameter not in `params` never crashes the branch."""
+    r = _breach_row(pred=55.0)
+    out = decide(_frame([r]), PARAMS, THETA, Y_spec={**YSPEC, "I_gate": 1.0})
+    assert out.loc[0, "decision"] == "FLAG"
+
+
+def test_full_pipeline_flags_predicted_breach(df_wired):
+    """The wired pipeline (intervals+ood on) runs with Y_spec threaded: any
+    breach-branch reason must cite a parameter AND a limit value (never crash
+    or emit a bare-score reason), and the decision vocabulary stays valid."""
+    df_full, results = df_wired
+    breach_reasons = df_full["reason"].str.contains("Predicted 168h", na=False)
+    for reason in df_full.loc[breach_reasons, "reason"]:
+        assert any(p in reason for p in PARAMS), f"breach reason lacks a parameter: {reason}"
+        assert "limit" in reason, f"breach reason lacks the limit: {reason}"
+    assert set(df_full["decision"].unique()) <= {"PASS", "REVIEW", "FLAG"}
+
+
+# ---------------------------------------------------------------------------
 # max_relative_width + derive_theta_width (main.py)
 # ---------------------------------------------------------------------------
 def test_max_relative_width_takes_row_max():

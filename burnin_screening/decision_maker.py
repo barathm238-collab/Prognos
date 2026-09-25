@@ -5,15 +5,31 @@ this file.
 It reads ONLY the documented output columns of both modules (contracts §4c
 and §4d) — never either module's internals.
 
-Decision priority order (first match wins — 1-4 per Prompt A4, 5-6 are the
-🔵 Phase 3 REVIEW branches):
-  1. Any {p}_hard_flag True                         -> FLAG (Tier 1 violation)
-  2. joint_outlier_flag True                        -> FLAG (Tier 3 joint anomaly)
-  3. static_outlier_flag True                       -> FLAG (fused lot outlier)
-  4. drift_flag True (Module B)                     -> FLAG (safety-slope breach)
-  5. ood_flag True (Module B OOD gate)              -> REVIEW (OOD inputs)
-  6. widest 168h interval > theta_width             -> REVIEW (low confidence)
-  7. Otherwise                                      -> PASS
+Decision priority order (first match wins — 1 per Prompt A4, 2 added per the
+Phase 1 review §8a, 3-5 per Prompt A4, 6-7 are the 🔵 Phase 3 REVIEW branches):
+  1. Any {p}_hard_flag True                         -> FLAG (Tier 1 violation, measured 24h)
+  2. {p}_168h_pred >= Y_spec[p] with a narrow interval -> FLAG (predicted 168h breach)
+  3. joint_outlier_flag True                        -> FLAG (Tier 3 joint anomaly)
+  4. static_outlier_flag True                       -> FLAG (fused lot outlier)
+  5. drift_flag True (Module B)                     -> FLAG (safety-slope breach)
+  6. ood_flag True (Module B OOD gate)              -> REVIEW (OOD inputs)
+  7. widest 168h interval > theta_width             -> REVIEW (low confidence)
+  8. Otherwise                                      -> PASS
+
+🔵 Predicted-breach FLAG (branch 2, Phase 1 review §8a): the design's own
+Module 4 decision table specifies FLAG on "predicted 168h value >= Y_spec with
+a narrow interval" as a trigger INDEPENDENT of the drift-slope gate. The drift
+gate answers "is this trending toward failure"; this branch answers the
+literal question "would the part's predicted end-of-test value itself violate
+the datasheet" — a component can stay under theta_slope yet have its
+predicted 168h value cross Y_spec (mild slope from a value already close to
+the limit). Requires Y_spec (dict param -> datasheet limit) threaded into
+decide(); Y_spec=None/{} leaves the branch inert so the Phase 3 7-branch
+behavior is unchanged for existing callers. "Narrow" means the parameter's
+relative interval width is <= theta_width — when intervals are off
+(theta_width=None) or missing, every predicted breach is flaggable (there is
+no width to check); a WIDE interval defers to the width-REVIEW branch instead
+of double-flagging an already low-confidence prediction.
 
 Every FLAG reason names a specific parameter — never just a bare score. This
 is what satisfies the Explainability evaluation metric: a QA inspector must
@@ -33,14 +49,14 @@ FLAG "once interval width and OOD score exist" — both exist since Phase 2).
 REVIEW defers UNCERTAIN cases to a human instead of forcing a guess; it never
 overrides evidence-based detections:
 
-  5. OOD gate fired (ood_flag True) but no FLAG branch did
+  6. OOD gate fired (ood_flag True) but no FLAG branch did
      -> REVIEW ("failure physics outside the training distribution — the
      point predictions and intervals are not trustworthy here").
-  6. A would-PASS row whose widest 168h conformal interval is unusually wide
+  7. A would-PASS row whose widest 168h conformal interval is unusually wide
      relative to its point prediction
      -> REVIEW ("the model is guessing — per architecture guide #3, treat
      any prediction with a very wide interval as unreliable").
-  7. Otherwise -> PASS.
+  8. Otherwise -> PASS.
 
 Both REVIEW conditions degrade gracefully: on a contract-minimum frame
 (no interval columns, no ood_flag) every missing/non-finite value counts as
@@ -181,6 +197,7 @@ def decide(
     params: list,
     theta_slope: float,
     theta_width: float | None = None,
+    Y_spec: dict | None = None,
 ) -> pd.DataFrame:
     """Returns df with two new columns: decision ("PASS"/"REVIEW"/"FLAG") and
     reason.
@@ -191,6 +208,13 @@ def decide(
         params: list of parameter names, e.g. ["I_leak", "I_ddq", "t_pd"].
         theta_slope: the safety-slope threshold computed by Module B (logged
             alongside its outputs) — cited in drift FLAG reasons.
+        Y_spec: 🔵 optional dict[param -> datasheet limit] enabling the
+            predicted-168h-breach FLAG branch (Phase 1 review §8a — the
+            design decision table's "predicted value >= Y_spec with a narrow
+            interval" rule, ranked below the measured 24h violation and above
+            all statistical layers). None/{} -> branch inert, degrading to the
+            previous 7-branch behavior. Parameters absent from the dict are
+            skipped, never crash.
         theta_width: 🔵 REVIEW threshold for the conformal interval width —
             the median + 3*MAD of the per-row maximum relative interval width
             over the normal population (same derivation philosophy as
@@ -199,9 +223,10 @@ def decide(
             binary PASS/FLAG of the required path.
 
     REVIEW is consulted only when no FLAG branch fired: evidence-based
-    detections (hard limit, joint anomaly, lot outlier, drift breach) stay
-    actionable — the OOD/uncertainty signals modulate CONFIDENCE, not guilt
-    (decided with the team for Phase 3; conservative for false negatives).
+    detections (hard limit, predicted 168h breach, joint anomaly, lot
+    outlier, drift breach) stay actionable — the OOD/uncertainty signals
+    modulate CONFIDENCE, not guilt (decided with the team for Phase 3;
+    conservative for false negatives).
     """
     df = df.copy()
 
@@ -221,7 +246,37 @@ def decide(
             reasons.append(f"Hard limit violated on: {', '.join(hard_hits)}. {details}.")
             continue
 
-        # 2. Tier 3 — joint multi-parameter anomaly (Isolation Forest)
+        # 2. 🔵 Predicted 168h breach (Phase 1 review §8a): the design
+        #    decision table's "predicted 168h value >= Y_spec with a narrow
+        #    interval" rule — independent of the drift-slope gate. Inert
+        #    without Y_spec; "narrow" is checked against the parameter's
+        #    relative interval width only when a theta_width exists, so a
+        #    wide-interval prediction defers to the width REVIEW instead of
+        #    double-flagging low-confidence numbers.
+        if Y_spec:
+            pred_hits: list[tuple[str, float, float]] = []
+            for p in params:
+                limit = Y_spec.get(p)
+                if limit is None:
+                    continue
+                pred = _finite(row, f"{p}_168h_pred")
+                if pred is None or pred < limit:
+                    continue
+                if theta_width is not None and _rel_widths(row, params).get(p, 0.0) > theta_width:
+                    continue  # wide interval -> width REVIEW may catch it instead
+                pred_hits.append((p, pred, float(limit)))
+            if pred_hits:
+                details = ", ".join(
+                    f"{p} predicted {v:.3g} (limit {lim:.3g})" for p, v, lim in pred_hits
+                )
+                decisions.append("FLAG")
+                reasons.append(
+                    "Predicted 168h value would cross the datasheet limit, "
+                    f"independent of drift rate: {details}."
+                )
+                continue
+
+        # 3. Tier 3 — joint multi-parameter anomaly (Isolation Forest)
         if row.get("joint_outlier_flag", False):
             top = _driving_param(row, params, "{p}_z")
             decisions.append("FLAG")
@@ -231,7 +286,7 @@ def decide(
             )
             continue
 
-        # 3. Fused lot-relative outlier (weighted L2 over per-parameter Z)
+        # 4. Fused lot-relative outlier (weighted L2 over per-parameter Z)
         if row.get("static_outlier_flag", False):
             top = _driving_param(row, params, "{p}_z")
             decisions.append("FLAG")
@@ -241,7 +296,7 @@ def decide(
             )
             continue
 
-        # 4. Predicted drift breach (Module B safety-slope gate) — with the
+        # 5. Predicted drift breach (Module B safety-slope gate) — with the
         #    96h trajectory line for the driving parameter (explanation trail)
         if row.get("drift_flag", False):
             top = _driving_param(row, params, "{p}_slope_norm")
@@ -254,7 +309,7 @@ def decide(
             )
             continue
 
-        # 5. 🔵 OOD gate (Module B helpers, wired by main.py): failure physics
+        # 6. 🔵 OOD gate (Module B helpers, wired by main.py): failure physics
         #    outside the training distribution — predictions carry no trust
         #    here. Deferred to a human instead of forcing a guess.
         if row.get("ood_flag", False):
@@ -269,7 +324,7 @@ def decide(
             )
             continue
 
-        # 6. 🔵 Unusually wide conformal interval on an otherwise-clean row:
+        # 7. 🔵 Unusually wide conformal interval on an otherwise-clean row:
         #    the model is guessing (architecture guide #3 — "treat any
         #    prediction with a very wide interval as unreliable").
         if theta_width is not None:
@@ -286,7 +341,7 @@ def decide(
                     )
                     continue
 
-        # 7. Clean pass
+        # 8. Clean pass
         decisions.append("PASS")
         reasons.append("Within limits, lot-normal, no joint anomaly, drift within safety bounds.")
 

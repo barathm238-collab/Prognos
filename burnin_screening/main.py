@@ -102,7 +102,8 @@ def derive_theta_width(df: pd.DataFrame, params: list = PARAMS) -> float:
 
 
 def apply_progressive_refinement(df: pd.DataFrame, params: list = PARAMS,
-                                 theta_k: float = 2.4) -> pd.DataFrame:
+                                 theta_k: float = 2.4,
+                                 theta_by_lot: dict | None = None) -> pd.DataFrame:
     """🔵 Progressive refinement layer (Prompt B5 / architecture guide add-on).
 
     For each parameter and each refinement horizon, prefer a real measured
@@ -181,6 +182,16 @@ def apply_progressive_refinement(df: pd.DataFrame, params: list = PARAMS,
         df[f"{p}_slope_norm"] = df[f"{p}_slope"] / (sd + 1e-6)
     weights = {p: 1.0 for p in params}
     df["v_drift"] = np.sqrt(sum(weights[p] * df[f"{p}_slope_norm"] ** 2 for p in params))
+    if theta_by_lot:
+        # 🔵 §8b: recompute refined drift flags under the SAME per-lot blended
+        # theta Module B used (rows in lots missing from the dict fall back to
+        # the median across the dict — defensive; every row has a lot_id).
+        theta_map = pd.Series(dict(theta_by_lot))
+        row_theta = df["lot_id"].map(theta_map)
+        fallback = float(np.median(list(theta_by_lot.values())))
+        row_theta = row_theta.fillna(fallback).to_numpy(dtype=float)
+        df["drift_flag"] = df["v_drift"].to_numpy(dtype=float) > row_theta
+        return df
     normal_v = df.loc[mask, "v_drift"].to_numpy(dtype=float)
     med = float(np.median(normal_v))
     mad = float(np.median(np.abs(normal_v - med)))
@@ -190,7 +201,8 @@ def apply_progressive_refinement(df: pd.DataFrame, params: list = PARAMS,
 
 def run_pipeline(df_input: pd.DataFrame, params: list = PARAMS, verbose: bool = True,
                  with_intervals: bool = True, with_ood: bool = True,
-                 with_progressive_refinement: bool = True, theta_k: float = 2.4):
+                 with_progressive_refinement: bool = True, theta_k: float = 2.4,
+                 theta_blended: bool = False):
     """Run the full pipeline; returns (df_full, results_dict).
 
     The 🔵 add-on switches (Phase 3) all default True for the demo run and
@@ -199,9 +211,16 @@ def run_pipeline(df_input: pd.DataFrame, params: list = PARAMS, verbose: bool = 
     is inert unless the frame carries {p}_{h}h_actual columns. Every
     combination still produces a valid decision frame.
 
-    theta_k: TEAM-TUNED MAD multiplier for Module B's theta_slope gate
+        theta_k: TEAM-TUNED MAD multiplier for Module B's theta_slope gate
     (default 2.4 for this demo, see run_module_b's docstring for the joint
     tuning story). Pass 3.0 for Prompt B2's literal spec value.
+        theta_blended: 🔵 Phase 1 review §8b — per-lot Empirical-Bayes-blended
+    theta_slope (Module A's small-lot pattern applied to Module B's gate).
+    Default False: the required path's single global theta_slope is unchanged.
+    When True, Module B returns dict[lot_id -> theta] and drift_flag is
+    computed per lot inside Module B; this function just carries the dict
+    through to progressive refinement so refined flags recompute under the
+    SAME per-lot rules.
     """
     # Y_spec from the data itself (columns Y_spec_{p} are part of the frozen schema)
     Y_spec = {p: float(df_input[f"Y_spec_{p}"].iloc[0]) for p in params}
@@ -216,11 +235,12 @@ def run_pipeline(df_input: pd.DataFrame, params: list = PARAMS, verbose: bool = 
     # along in df_b and are consumed by the Decision Maker's width-REVIEW.
     result_b = module_b_temporal.run_module_b(
         df_input, params, train=True, static_outlier_flag=df_a["static_outlier_flag"],
-        with_intervals=with_intervals, theta_k=theta_k,
+        with_intervals=with_intervals, theta_k=theta_k, theta_blended=theta_blended,
     )
 
     # Contract §4d says run_module_b returns (df, models); Prompt B2 allows
-    # theta_slope as a third element — accept both shapes.
+    # theta_slope as a third element — accept both shapes. With theta_blended
+    # (§8b) the third element is dict[lot_id -> theta] instead of a float.
     if len(result_b) == 3:
         df_b, models_b, theta_b = result_b
     else:
@@ -232,8 +252,15 @@ def run_pipeline(df_input: pd.DataFrame, params: list = PARAMS, verbose: bool = 
     df_full = df_a.merge(df_b[["component_id"] + b_cols], on="component_id")
 
     # --- Safety-slope threshold (Module B's own value preferred; the
-    #     fallback derives median + theta_k*MAD over the same population) ---
-    theta_slope = theta_b if theta_b is not None else derive_theta_slope(df_full, theta_k)
+    #     fallback derives median + theta_k*MAD over the same population).
+    #     §8b: dict => per-lot blended theta — use the GLOBAL-lot value (or
+    #     the median across lots) as the scalar cited in drift reasons. ---
+    if isinstance(theta_b, dict):
+        theta_slope = theta_b.get("GLOBAL")
+        if theta_slope is None:
+            theta_slope = float(np.median(list(theta_b.values())))
+    else:
+        theta_slope = theta_b if theta_b is not None else derive_theta_slope(df_full, theta_k)
 
     # --- 🔵 OOD gate (Prompt B4) — fit on raw regression inputs, one verdict
     #     per component via Module B's documented combined feature set ---
@@ -253,10 +280,16 @@ def run_pipeline(df_input: pd.DataFrame, params: list = PARAMS, verbose: bool = 
 
     # --- 🔵 Progressive refinement (Prompt B5): no-op without actual columns ---
     if with_progressive_refinement:
-        df_full = apply_progressive_refinement(df_full, params, theta_k=theta_k)
+        df_full = apply_progressive_refinement(
+            df_full, params, theta_k=theta_k,
+            theta_by_lot=theta_b if isinstance(theta_b, dict) else None,
+        )
 
     # --- Decision Maker + validation ---
-    df_full = decide(df_full, params, theta_slope, theta_width=theta_width)
+    # Y_spec is threaded so the predicted-168h-breach FLAG branch (Phase 1
+    # review §8a) is active in the full pipeline; decide() degrades to the
+    # previous 7-branch behavior when called without it.
+    df_full = decide(df_full, params, theta_slope, theta_width=theta_width, Y_spec=Y_spec)
     results = validate(df_full)
     results["theta_slope"] = theta_slope
     results["theta_width"] = theta_width

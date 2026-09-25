@@ -37,7 +37,8 @@ Implemented behavior (Prompt B1 + B2):
 
 Output contract (§4d — frozen, do not rename):
   run_module_b(df, params, train=True) returns (df, models, theta_slope)
-  where df has these columns ADDED:
+  where df has these columns ADDED (theta_slope may be a float or, with
+  theta_blended=True, a dict[lot_id -> float] — see the theta_blended note):
     {p}_96h_pred     float — auxiliary forecast (🔵, never validated against)
     {p}_168h_pred    float — required forecast (🟢, graded via MAE)
     {p}_168h_lower   float — MAPIE 95% lower bound (🔵, with_intervals=True only)
@@ -84,6 +85,9 @@ MAD_FLOOR = 1e-6
 STD_FLOOR = 1e-6
 # MAPIE conformal level (Prompt B3: predict(X, alpha=0.05) == a 95% interval).
 MAPIE_CONFIDENCE_LEVEL = 0.95
+# Blending constant for the 🔵 per-lot theta (§8b) — same N/(N+K) shape as
+# Module A's small-lot blending (K=30 per the doc).
+SMALL_LOT_K = 30
 
 
 def _normal_mask(df: pd.DataFrame, static_outlier_flag) -> np.ndarray:
@@ -108,6 +112,7 @@ def run_module_b(
     models: dict | None = None,
     with_intervals: bool = False,
     theta_k: float = 3.0,
+    theta_blended: bool = False,
 ):
     """Run the temporal prediction stack. See module docstring for the exact
     output columns added (contract §4d) and the return signature.
@@ -130,6 +135,17 @@ def run_module_b(
             {p}_168h_pred from the MAPIE-wrapped regressor. Only supported
             with train=True (the conformal model is fitted here). Default
             False so the required 🟢 path is byte-identical to B1+B2.
+        theta_blended: 🔵 Phase 1 review §8b — derive theta_slope PER LOT
+            using the same Empirical Bayes blending pattern as Module A's
+            small-lot Z (w = N/(N+30)): lot_theta = w * (lot median +
+            theta_k*lot MAD) + (1-w) * (global median + theta_k*global MAD).
+            Returns dict[lot_id -> float] instead of a float; drift_flag
+            uses each row's own lot's blended theta. Small lots shrink
+            toward the global prior, so their gate stops being noise-driven.
+            Default False — the required 🟢 path (single global theta_slope)
+            is unchanged. Intended for real burn-in data where small lots
+            are common; on data without small lots it degenerates to ~the
+            global value (w -> 1 for large lots).
         theta_k: MAD multiplier in theta_slope = median + theta_k * MAD of the
             normal population's v_drift. Prompt B2's literal spec is 3.0 (the
             default — required path unchanged). Tunable by TEAM DECISION for
@@ -257,9 +273,48 @@ def run_module_b(
     med = float(np.median(normal_v))
     mad = float(np.median(np.abs(normal_v - med)))
     theta_slope = med + theta_k * mad
+    if theta_blended:
+        # 🔵 §8b: per-lot Empirical-Bayes-blended theta (default OFF — see
+        # the docstring). Returns a dict keyed by lot_id; drift_flag uses
+        # each row's own lot's blended theta.
+        theta_by_lot = _theta_slope_blended(df, mask, theta_k=theta_k)
+        row_theta = df["lot_id"].map(theta_by_lot).to_numpy(dtype=float)
+        df["drift_flag"] = df["v_drift"].to_numpy(dtype=float) > row_theta
+        return df, models, theta_by_lot
     df["drift_flag"] = df["v_drift"] > theta_slope
 
     return df, models, theta_slope
+
+
+def _theta_slope_blended(
+    df: pd.DataFrame, mask: np.ndarray, lot_col: str = "lot_id", theta_k: float = 3.0
+) -> dict:
+    """🔵 Per-lot theta_slope with Empirical Bayes blending (§8b).
+
+    Reuses Module A's small-lot pattern (w = N/(N+30)) instead of inventing
+    new logic: for each lot, the blended theta is w * (lot median + theta_k *
+    lot MAD) + (1-w) * (global median + theta_k * global MAD), all computed
+    over the SAME normal population (mask) the global gate uses. Large lots
+    (w -> 1) keep their own statistics; small lots shrink toward the global
+    prior so their gate is not dominated by noise. Global fallback for any
+    lot missing from the frame (defensive; every row has a lot_id per §4b).
+    """
+    normal_v = df.loc[mask, "v_drift"].to_numpy(dtype=float)
+    global_med = float(np.median(normal_v))
+    global_mad = float(np.median(np.abs(normal_v - global_med)))
+    global_theta = global_med + theta_k * global_mad
+
+    theta_by_lot: dict = {}
+    lot_ids = df.loc[mask, lot_col]
+    v_by_lot = df.loc[mask, "v_drift"].groupby(lot_ids)
+    for lot, vals in v_by_lot:
+        n_lot = int(df.loc[mask & (df[lot_col] == lot), lot_col].count())
+        w = n_lot / (n_lot + SMALL_LOT_K)
+        vals = vals.to_numpy(dtype=float)
+        lot_med = float(np.median(vals))
+        lot_mad = float(np.median(np.abs(vals - lot_med)))
+        theta_by_lot[lot] = w * (lot_med + theta_k * lot_mad) + (1 - w) * global_theta
+    return theta_by_lot
 
 
 def module_b_new_cols(params: list, with_intervals: bool = False) -> list[str]:
