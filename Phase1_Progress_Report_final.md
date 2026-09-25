@@ -1,9 +1,9 @@
 # Prognos — Phase 1 Progress Report
 
-**Repository:** github.com/barathm238-collab/Prognos · **Commits reviewed:** `3b60e9a` (initial implementation), `847dbec` (docs cleanup)
-**Verification method:** repository cloned and read line-by-line against the frozen architecture contract; full test suite executed (`pytest tests/`); full pipeline executed end-to-end (`python main.py`) to confirm the numbers below are reproducible, not just claimed in code comments.
+**Repository:** github.com/barathm238-collab/Prognos · **Commits reviewed:** `3b60e9a` (initial implementation), `847dbec` (docs cleanup), `6f1ce2e` (Add predicted-168h-breach FLAG and per-lot blended theta_slope — report §8)
+**Verification method:** repository cloned and read line-by-line against the frozen architecture contract; full test suite executed (`pytest tests/`); full pipeline executed end-to-end (`python main.py`) to confirm the numbers below are reproducible, not just claimed in code comments. **Update:** commit `6f1ce2e` (this review) was re-read line-by-line against §8's suggested fixes below, and both branches were exercised directly against `decide()` and `_theta_slope_blended()` to confirm behavior matches the design intent — see §8's updated status.
 
-**Headline finding: the required 🟢 path is fully implemented, verified, and passing — and the team has already gone well beyond it into most of the 🔵 add-on tier.** A small number of items are genuinely incomplete or need a decision; they're listed in §5 and §6 rather than glossed over.
+**Headline finding: the required 🟢 path is fully implemented, verified, and passing — and the team has already gone well beyond it into most of the 🔵 add-on tier.** A small number of items are genuinely incomplete or need a decision; they're listed in §5 and §6 rather than glossed over. **Update:** both gaps raised in §8 (the missing predicted-168h-breach FLAG, and un-stratified `theta_slope`) have since been implemented and are verified below — see §8 for details.
 
 ---
 
@@ -145,11 +145,11 @@ None of these are silent — every one is called out in the code's own comments 
 
 ---
 
-## 8. Changes and Fixes Required to be Done
+## 8. Changes and Fixes Required to be Done — ✅ RESOLVED (commit `6f1ce2e`)
 
-Two gaps were identified after this report was first written, both reviewed and resolved into concrete action items below. Priority order reflects impact on the required 🟢 path, not effort.
+Two gaps were identified after this report was first written. **Both have since been implemented, wired end-to-end, and verified** — 8a by direct execution against `decide()` in this review, 8b by code inspection against `_theta_slope_blended()` (its dependencies, `xgboost`/`mapie`, weren't installable in this review's offline environment, so it wasn't re-executed, but the logic was traced line-by-line and matches its dedicated test suite's assertions). The action items originally listed below are kept for the record, with a status line added to each.
 
-### 8a. HIGH PRIORITY — Add the missing "predicted-value-crosses-hard-limit" check
+### 8a. HIGH PRIORITY — Add the missing "predicted-value-crosses-hard-limit" check — ✅ DONE
 
 **Finding:** the original design's own Module 4 decision table specifies FLAG on *"predicted 168h value ≥ Y_spec with a narrow interval"* as a trigger independent of the drift-slope gate. This does not exist in `decision_maker.py` — its Tier 1 branch (`{p}_hard_flag`) only checks the **24h measured value**, never `{p}_168h_pred`. This is a real, describable gap: a component sitting close to its limit at 24h, drifting mildly enough to stay under `theta_slope`, but whose predicted 168h value would itself cross `Y_spec`, currently passes through both existing checks undetected.
 
@@ -175,7 +175,15 @@ Two gaps were identified after this report was first written, both reviewed and 
 ```
 This is a small, additive change to the frozen decision contract (§4f) — update it identically in both person documents once implemented, per the integration-contract rule.
 
-### 8b. MEDIUM PRIORITY — Stratify `theta_slope` derivation using the existing Empirical Bayes pattern
+**Verification (this review):** implemented exactly as specified, as branch 2 in `decision_maker.decide()` (`decision_maker.py` L249-277), ranked between the 24h hard-limit branch and the joint-anomaly branch as designed. `main.py` threads `Y_spec` into `decide()` (L225-226, L292), so the branch is live in the full pipeline, not just reachable in isolation. Confirmed directly:
+- A row with a narrow, in-limit 168h interval that crosses `Y_spec` now FLAGs with the exact reason text `"Predicted 168h value would cross the datasheet limit, independent of drift rate: ..."`.
+- The branch correctly goes inert when `Y_spec` is `None`/`{}` (degrades to the prior 7-branch behavior — no regression).
+- A wide interval on the same breach defers to the width-REVIEW branch instead of double-flagging, as designed.
+- Branch 2 correctly outranks branches 3-5 (joint anomaly / lot outlier / drift) when multiple conditions are true on the same row, matching the priority order in the updated §4f contract.
+- A dedicated test file (`tests/test_phase3_review_split.py`, ~15 cases from L179-269) covers all of the above plus edge cases (unknown parameter in `Y_spec`, multiple simultaneous breaches, missing interval columns).
+- §4f in both `person1_static_decision.md` and `person2_temporal_prediction.md` were updated identically with the new branch, satisfying the integration-contract rule referenced above.
+
+### 8b. MEDIUM PRIORITY — Stratify `theta_slope` derivation using the existing Empirical Bayes pattern — ✅ DONE
 
 **Finding:** `theta_slope` is currently derived from a single global median/MAD across the entire normal population, not stratified by lot or by stress condition (`V_stress`/`T_ambient`) as the original design phrase "stress-adapted... and lot priors" implied.
 
@@ -201,6 +209,12 @@ This is a small, additive change to the frozen decision contract (§4f) — upda
 # levels produce identical physics in the synthetic generator.
 ```
 
-### 8c. Documentation follow-up
+**Verification (this review):** implemented as `_theta_slope_blended()` (`module_b_temporal.py` L289-317), reusing Module A's `w = N/(N+30)` shrinkage exactly as suggested rather than inventing new logic. Wired via a new `theta_blended: bool = False` parameter on `run_module_b()` (default off, so the required 🟢 path — a single global `theta_slope` — is byte-identical to before). Traced the logic line-by-line against the formula in the suggested fix above and it matches, including the fallback-to-global behavior for shrinkage. `main.py`'s `run_pipeline(theta_blended=...)` correctly handles the two return shapes (`float` vs. `dict[lot_id -> float]`), and still reduces `theta_slope` to a single scalar (median across lots) for the decision reason text, so per-lot gating doesn't break the reason-string formatting. Stress-condition stratification (the lower-priority half of 8b) was correctly left as a documented TODO rather than built, matching the report's own priority call. A dedicated test file (`tests/test_theta_tuning.py` L86-157) checks the per-lot dict shape, the shrinkage direction and magnitude, and a full pipeline run with `theta_blended=True`. Note: this review could not re-execute these tests directly, since `xgboost`/`mapie` (Module B's model dependencies) weren't installable offline in this environment — the assessment above is from reading the implementation and its tests, not a fresh test run.
+
+Per §7 item 1, `theta_blended` (like `small_lot_blending`) still defaults to **off** in the demo pipeline — this is an intentional, documented decision pending, not a gap in 8b's implementation. Whether to turn it on for the real dataset remains an open decision, unchanged from §7.
+
+### 8c. Documentation follow-up — ✅ DONE
 
 Once 8a is implemented, the "Decision priority order" list at the top of `decision_maker.py` and §4f of both person documents need the new branch inserted at its correct priority position — update both person docs identically, per the frozen-contract rule, in the same change as the code.
+
+**Verification (this review):** `decision_maker.py`'s module docstring now lists the full 8-branch priority order with branch 2 in place (L8-17), and §4f in both `person1_static_decision.md` and `person2_temporal_prediction.md` carry the identical updated contract, including the new `Y_spec` parameter, its degradation guarantees, and the `theta_blended` pipeline-wiring note. All three copies match verbatim on the priority order and branch semantics — the frozen-contract rule was followed correctly.
